@@ -13,12 +13,12 @@ permissions:
 
 concurrency:
   group: "pages"
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -36,8 +36,20 @@ jobs:
       - name: Install Chromium for Playwright
         run: python -m playwright install --with-deps chromium
 
+      - name: Preflight UH access
+        run: timeout 60s python update_fall_2026.py --smoke-test
+
       - name: Refresh Fall 2026 data
-        run: python update_fall_2026.py
+        run: timeout 12m python update_fall_2026.py
+
+      - name: Upload diagnostics if refresh fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uh-refresh-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Save refreshed snapshot in repository
         shell: bash
