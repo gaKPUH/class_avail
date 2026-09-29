@@ -62,6 +62,7 @@ SUBJECT_TO_DEPARTMENT = {
 }
 
 DAY_LABELS = {"M": "Mon", "T": "Tue", "W": "Wed", "R": "Thu", "F": "Fri", "S": "Sat", "U": "Sun"}
+DIAGNOSTIC_DIR = Path("diagnostics")
 
 
 def clean(value: Any) -> str:
@@ -361,18 +362,142 @@ def parse_subject_html(page_html: str, expected_subject: str = "") -> list[dict[
     return records
 
 
-def wait_for_subject_page(page: Page, timeout_ms: int = 20000) -> None:
+def save_diagnostic(page: Page, subject: str, label: str) -> None:
+    DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"{label}_{subject.lower()}"
+    html_path = DIAGNOSTIC_DIR / f"{stem}.html"
+    png_path = DIAGNOSTIC_DIR / f"{stem}.png"
+    txt_path = DIAGNOSTIC_DIR / f"{stem}.txt"
+
     try:
-        page.wait_for_function(
-            """() => {
-                const t = document.body?.innerText || '';
-                return document.querySelectorAll('tr.dataRow').length > 0 ||
-                       /no (classes|sections|courses)|not found|invalid|new search/i.test(t);
-            }""",
-            timeout=timeout_ms,
+        html_path.write_text(page.content(), encoding="utf-8")
+    except Exception as exc:
+        print(f"[diagnostic] Could not save HTML: {exc}")
+
+    try:
+        page.screenshot(path=str(png_path), full_page=True)
+    except Exception as exc:
+        print(f"[diagnostic] Could not save screenshot: {exc}")
+
+    try:
+        body = page.locator("body").inner_text(timeout=2000)
+    except Exception as exc:
+        body = f"Could not read body text: {exc}"
+
+    txt_path.write_text(
+        f"URL: {page.url}\n\n{body[:12000]}",
+        encoding="utf-8",
+    )
+    print(f"[diagnostic] Saved {html_path}, {png_path}, and {txt_path}")
+
+
+def subject_page_state(page: Page, subject: str) -> str:
+    if page.locator("tr.dataRow").count() > 0:
+        return "rows"
+
+    try:
+        body = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return ""
+
+    body_l = body.lower()
+    valid_heading = (
+        "fall 2026" in body_l
+        and "kapiolani community college" in body_l
+        and subject.lower() in body_l
+    )
+    table_header = "crn" in body_l and "course" in body_l and "credits" in body_l
+    explicit_empty = bool(
+        re.search(
+            r"no (?:classes|sections|courses|results)|"
+            r"there are no (?:classes|sections|courses)|"
+            r"0 (?:classes|sections|courses)",
+            body_l,
         )
-    except PlaywrightTimeoutError:
-        pass
+    )
+
+    if explicit_empty or (valid_heading and table_header):
+        return "empty"
+    return ""
+
+
+def fetch_subject(
+    page: Page,
+    subject: str,
+    *,
+    goto_timeout_ms: int = 15000,
+    ready_timeout_s: float = 5.0,
+) -> list[dict[str, Any]]:
+    url = f"{SOURCE_ROOT}/{TERM}/{CAMPUS}/{subject}"
+
+    try:
+        response = page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=goto_timeout_ms,
+        )
+    except Exception:
+        save_diagnostic(page, subject, "navigation_failure")
+        raise
+
+    status = response.status if response else None
+    if status is not None and status >= 400:
+        save_diagnostic(page, subject, f"http_{status}")
+        raise RuntimeError(f"HTTP {status} for {url}")
+
+    deadline = time.monotonic() + ready_timeout_s
+    state = ""
+    while time.monotonic() < deadline:
+        state = subject_page_state(page, subject)
+        if state:
+            break
+        time.sleep(0.25)
+
+    if not state:
+        save_diagnostic(page, subject, "unexpected_page")
+        raise RuntimeError(
+            f"{subject}: page never looked like a Fall 2026 Kapiʻolani subject page "
+            f"within {ready_timeout_s:.1f} seconds. Final URL: {page.url}"
+        )
+
+    html = page.content()
+    records = parse_subject_html(html, subject)
+
+    if state == "rows" and not records:
+        save_diagnostic(page, subject, "parser_failure")
+        raise RuntimeError(
+            f"{subject}: the page had course rows, but the parser extracted none."
+        )
+
+    return records
+
+
+def smoke_test(page: Page) -> None:
+    print("Preflight: testing UH access with ESOL ...", flush=True)
+    records = fetch_subject(
+        page,
+        "ESOL",
+        goto_timeout_ms=12000,
+        ready_timeout_s=4.0,
+    )
+    if not records:
+        save_diagnostic(page, "ESOL", "preflight_no_rows")
+        raise RuntimeError(
+            "Preflight failed: ESOL returned no course rows. "
+            "The GitHub runner may not be seeing the same UH page as a normal browser."
+        )
+
+    wrong = sorted(
+        {str(r.get("courseAlpha") or "") for r in records}
+        - {"ESOL"}
+    )
+    if wrong:
+        save_diagnostic(page, "ESOL", "preflight_wrong_alpha")
+        raise RuntimeError(
+            f"Preflight failed: unexpected course alphas on ESOL page: {wrong}"
+        )
+
+    print(f"Preflight passed: ESOL returned {len(records)} section(s).", flush=True)
 
 
 def collect(page: Page, delay: float = 0.15) -> list[dict[str, Any]]:
@@ -380,27 +505,28 @@ def collect(page: Page, delay: float = 0.15) -> list[dict[str, Any]]:
     errors: list[str] = []
 
     for index, subject in enumerate(SUBJECTS, 1):
-        url = f"{SOURCE_ROOT}/{TERM}/{CAMPUS}/{subject}"
-        print(f"[{index:02d}/{len(SUBJECTS):02d}] {subject}: ", end="", flush=True)
+        print(
+            f"[{index:02d}/{len(SUBJECTS):02d}] {subject}: ",
+            end="",
+            flush=True,
+        )
         try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            wait_for_subject_page(page)
-            records = parse_subject_html(page.content(), subject)
-            status = response.status if response else None
-            if status is not None and status >= 500:
-                raise RuntimeError(f"HTTP {status}")
+            records = fetch_subject(page, subject)
             all_records.extend(records)
-            print(f"{len(records)} section(s)")
+            print(f"{len(records)} section(s)", flush=True)
         except Exception as exc:
             errors.append(f"{subject}: {exc}")
-            print(f"ERROR: {exc}")
+            print(f"ERROR: {exc}", flush=True)
+            # One bad subject means the snapshot would be incomplete. Fail fast
+            # rather than waiting through the rest of the alphabet.
+            break
 
         if delay:
             time.sleep(delay)
 
     if errors:
         raise RuntimeError(
-            "One or more subject pages failed; refusing to publish an incomplete update:\n"
+            "Subject collection failed; refusing to publish an incomplete update:\n"
             + "\n".join(errors)
         )
 
@@ -425,7 +551,6 @@ def collect(page: Page, delay: float = 0.15) -> list[dict[str, Any]]:
                 by_key[key] = record
 
     return list(by_key.values())
-
 
 def extract_data(html: str) -> tuple[list[dict[str, Any]], int, int]:
     start_marker = "const DATA="
@@ -545,6 +670,11 @@ def main() -> None:
         default="course_browser_fall_2026_current.json",
     )
     parser.add_argument("--delay", type=float, default=0.15)
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Test one known ESOL page and exit without changing any files.",
+    )
     args = parser.parse_args()
 
     html_path = Path(args.html)
@@ -565,6 +695,14 @@ def main() -> None:
             ),
         )
         page = context.new_page()
+        page.set_default_timeout(5000)
+        page.set_default_navigation_timeout(15000)
+
+        smoke_test(page)
+        if args.smoke_test:
+            browser.close()
+            return
+
         records = collect(page, delay=max(0.0, args.delay))
         browser.close()
 
