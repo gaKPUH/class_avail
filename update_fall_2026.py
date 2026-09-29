@@ -31,8 +31,8 @@ SUBJECTS = [
     "ACC", "AMST", "ANTH", "ART", "ASAN", "ASL", "ASTR",
     "BIOC", "BIOL", "BLAW", "BOT", "BUS",
     "CE", "CHEM", "CHN", "CHW", "COM", "CULN",
-    "DENT", "DNCE",
-    "EALL", "ECON", "ED", "EE", "EMT", "ENG", "ENT", "ERTH", "ES", "ESL", "ESOL", "ESS",
+    "DENT", "DMS", "DNCE",
+    "EALL", "ECE", "ECON", "ED", "EE", "EMSP", "EMT", "ENG", "ENT", "ERTH", "ES", "ESL", "ESOL", "ESS",
     "FIL", "FR", "FSHE", "GEO",
     "HAW", "HDFS", "HIST", "HLTH", "HOST", "HUM", "HWST",
     "ICS", "IS", "ITS", "JPN", "JOUR", "KOR",
@@ -40,7 +40,7 @@ SUBJECTS = [
     "MATH", "ME", "MEDA", "MGT", "MICR", "MICT", "MLT", "MUS",
     "NREM", "NURS", "OCN", "OEST", "OTA",
     "PACS", "PHIL", "PHRM", "PHYL", "PHYS", "POLS", "PSY", "PTA",
-    "RAD", "REL", "RESP", "SCI", "SLT", "SOC", "SP", "SPAN", "SSCI", "SW",
+    "RAD", "REL", "RESP", "SCI", "SLT", "SOC", "SP", "SPAN", "SSCI", "SUST", "SW",
     "THEA", "WS", "ZOO",
 ]
 
@@ -416,70 +416,39 @@ def subject_page_state(page: Page, subject: str) -> str:
         )
     )
 
+    generic_selector = (
+        "select a term" in body_l
+        and "select a campus" in body_l
+        and "class availability portal" in body_l
+    )
+
+    if generic_selector:
+        return "not_available"
     if explicit_empty or (valid_heading and table_header):
         return "empty"
     return ""
 
 
-def discover_subjects(page: Page) -> list[str]:
-    """Read the current Kapiʻolani subject list from the UH portal.
+def subjects_for_refresh(old_records: list[dict[str, Any]]) -> list[str]:
+    """Return a stable refresh list without depending on the landing-page UI.
 
-    This avoids keeping a stale hard-coded alpha list. Subjects can be added or
-    removed during a term, and an unavailable alpha redirects to the generic
-    subject selector rather than returning a conventional 404.
+    The UH portal redirects an unavailable subject alpha to its generic
+    term/campus selector. We can safely probe a broad known list because
+    fetch_subject() recognizes that redirect as zero sections. Alphas already
+    present in the published snapshot are always included as well.
     """
-    url = f"{SOURCE_ROOT}/{TERM}/{CAMPUS}"
-    print("Discovering current Kapiʻolani subject list ...", flush=True)
-
-    try:
-        response = page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=15000,
-        )
-    except Exception:
-        save_diagnostic(page, "SUBJECTS", "subject_list_navigation_failure")
-        raise
-
-    status = response.status if response else None
-    if status is not None and status >= 400:
-        save_diagnostic(page, "SUBJECTS", f"subject_list_http_{status}")
-        raise RuntimeError(f"HTTP {status} while loading {url}")
-
-    deadline = time.monotonic() + 8.0
-    subjects: list[str] = []
-
-    while time.monotonic() < deadline:
-        try:
-            texts = page.locator("button").all_inner_texts()
-        except Exception:
-            texts = []
-
-        found: list[str] = []
-        for raw in texts:
-            code = clean(raw).upper()
-            if re.fullmatch(r"[A-Z][A-Z0-9]{1,5}", code):
-                if code not in found:
-                    found.append(code)
-
-        if len(found) >= 40 and "ESOL" in found and "IS" in found:
-            subjects = found
-            break
-
-        time.sleep(0.25)
-
-    if not subjects:
-        save_diagnostic(page, "SUBJECTS", "subject_list_unexpected")
-        raise RuntimeError(
-            "Could not discover a plausible Kapiʻolani subject list from the UH portal."
-        )
-
+    from_snapshot = {
+        str(record.get("courseAlpha") or "").upper()
+        for record in old_records
+        if str(record.get("courseAlpha") or "").strip()
+    }
+    subjects = sorted(set(SUBJECTS) | from_snapshot)
     print(
-        f"Discovered {len(subjects)} current subjects: "
-        + ", ".join(subjects),
+        f"Refreshing {len(subjects)} known/current subject alphas.",
         flush=True,
     )
     return subjects
+
 
 
 def fetch_subject(
@@ -521,6 +490,10 @@ def fetch_subject(
             f"within {ready_timeout_s:.1f} seconds. Final URL: {page.url}"
         )
 
+    if state == "not_available":
+        print("not currently listed", flush=True)
+        return []
+
     html = page.content()
     records = parse_subject_html(html, subject)
 
@@ -533,7 +506,10 @@ def fetch_subject(
     return records
 
 
-def smoke_test(page: Page) -> None:
+def smoke_test(
+    page: Page,
+    old_records: list[dict[str, Any]] | None = None,
+) -> None:
     print("Preflight: testing UH access with ESOL ...", flush=True)
     records = fetch_subject(
         page,
@@ -558,7 +534,34 @@ def smoke_test(page: Page) -> None:
             f"Preflight failed: unexpected course alphas on ESOL page: {wrong}"
         )
 
-    print(f"Preflight passed: ESOL returned {len(records)} section(s).", flush=True)
+    print(f"Preflight passed: ESOL returned {len(records)} row(s).", flush=True)
+
+    if old_records is not None:
+        old_esol = [
+            r for r in old_records
+            if str(r.get("courseAlpha") or "").upper() == "ESOL"
+        ]
+        old_crns = {str(r.get("crn") or "") for r in old_esol if r.get("crn")}
+        live_crns = {str(r.get("crn") or "") for r in records if r.get("crn")}
+        added = sorted(live_crns - old_crns)
+        removed = sorted(old_crns - live_crns)
+
+        print(
+            f"ESOL comparison: published snapshot has {len(old_esol)} row(s); "
+            f"live UH has {len(records)} row(s).",
+            flush=True,
+        )
+        if added:
+            print("ESOL CRNs newly seen live: " + ", ".join(added), flush=True)
+        if removed:
+            print("ESOL CRNs no longer seen live: " + ", ".join(removed), flush=True)
+        if len(old_esol) != len(records) and not added and not removed:
+            print(
+                "ESOL row count changed but the CRN set did not; "
+                "this suggests a duplicate/grouped presentation difference rather than a new CRN.",
+                flush=True,
+            )
+
 
 
 def collect(
@@ -763,8 +766,8 @@ def main() -> None:
         page.set_default_timeout(5000)
         page.set_default_navigation_timeout(15000)
 
-        smoke_test(page)
-        subjects = discover_subjects(page)
+        smoke_test(page, old_records)
+        subjects = subjects_for_refresh(old_records)
 
         if args.smoke_test:
             browser.close()
