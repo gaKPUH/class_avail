@@ -265,13 +265,21 @@ def parse_subject_html(page_html: str, expected_subject: str = "") -> list[dict[
             for child in grid.find_all("div", recursive=False)
             if isinstance(child, Tag)
         ]
-        stop = len(children)
-        for idx, child in enumerate(children):
-            if class_has(child, "dataFullRow") or class_has(child, "dataFullRowContent"):
-                stop = idx
-                break
 
-        main = children[:stop]
+        # Some UH subjects (for example EMSP) prepend a full-width course
+        # heading inside every data row.  Those elements also carry dataCell,
+        # so do not use "first dataFullRow means end of cells".  Instead,
+        # retain only ordinary schedule/data cells and exclude full-width
+        # headings, indents, details, and meeting filler cells explicitly.
+        main = [
+            child
+            for child in children
+            if class_has(child, "dataCell")
+            and not class_has(child, "dataFullRow")
+            and not class_has(child, "dataFullRowContent")
+            and not class_has(child, "dataFullRowIndent")
+            and not class_has(child, "meetingFiller")
+        ]
         if len(main) < 13:
             continue
 
@@ -290,15 +298,43 @@ def parse_subject_html(page_html: str, expected_subject: str = "") -> list[dict[
         title = clean(base[4].get_text(" ", strip=True))
         credits = clean(base[5].get_text(" ", strip=True))
         instructor, email = parse_instructor(base[6])
-        enrollment, enrollment_sort = parse_number_pair(base[7].get_text(" ", strip=True))
-        waitlist, waitlist_sort = parse_number_pair(base[8].get_text(" ", strip=True))
+
+        # Current UH layout uses separate "Currently Enrolled" and
+        # "Max Enrollment" cells.  Older snapshots used a combined enrollment
+        # cell plus a waitlist cell.  Detect the current layout from the page
+        # header so the browser remains compatible with either form.
+        page_text = soup.get_text(" ", strip=True)
+        modern_enrollment = (
+            "Currently Enrolled" in page_text
+            and "Max Enrollment" in page_text
+        )
+
+        if modern_enrollment:
+            enrolled_raw = clean(base[7].get_text(" ", strip=True))
+            max_raw = clean(base[8].get_text(" ", strip=True))
+            enrollment = (
+                f"{enrolled_raw}/{max_raw}"
+                if enrolled_raw and max_raw
+                else enrolled_raw or max_raw or "TBA"
+            )
+            m_enrolled = re.search(r"\d+", enrolled_raw)
+            enrollment_sort = float(m_enrolled.group(0)) if m_enrolled else -1.0
+            waitlist = ""
+            waitlist_sort = -1.0
+        else:
+            enrollment, enrollment_sort = parse_number_pair(
+                base[7].get_text(" ", strip=True)
+            )
+            waitlist, waitlist_sort = parse_number_pair(
+                base[8].get_text(" ", strip=True)
+            )
 
         meetings: list[dict[str, str]] = []
         first = parse_meeting(base[9:13])
         if first:
             meetings.append(first)
 
-        extras = [cell for cell in main[13:] if not class_has(cell, "meetingFiller")]
+        extras = main[13:]
         for pos in range(0, len(extras), 4):
             meeting = parse_meeting(extras[pos : pos + 4])
             if meeting:
