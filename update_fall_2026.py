@@ -427,60 +427,68 @@ def save_diagnostic(page: Page, subject: str, label: str) -> None:
     print(f"[diagnostic] Saved {html_path}, {png_path}, and {txt_path}")
 
 
-def subject_page_state(page: Page, subject: str) -> str:
-    if page.locator("tr.dataRow").count() > 0:
-        return "rows"
-
+def wait_for_subject_state(
+    page: Page,
+    subject: str,
+    timeout_ms: int = 12000,
+) -> str:
+    """Wait for a usable subject-page state with one bounded Playwright wait."""
     try:
-        body = page.locator("body").inner_text(timeout=2000)
-    except Exception:
+        handle = page.wait_for_function(
+            """(subject) => {
+                if (document.querySelectorAll('tr.dataRow').length > 0) {
+                    return 'rows';
+                }
+                const body = (document.body?.innerText || '').toLowerCase();
+                const generic =
+                    body.includes('select a term') &&
+                    body.includes('select a campus') &&
+                    body.includes('class availability portal');
+                if (generic) return 'not_available';
+
+                const validHeading =
+                    body.includes('fall 2026') &&
+                    body.includes('kapiolani community college') &&
+                    body.includes(String(subject).toLowerCase());
+                const tableHeader =
+                    body.includes('crn') &&
+                    body.includes('course') &&
+                    body.includes('credits');
+                const explicitEmpty =
+                    /no (classes|sections|courses|results)|there are no (classes|sections|courses)|0 (classes|sections|courses)/i.test(body);
+
+                if (explicitEmpty || (validHeading && tableHeader)) {
+                    return 'empty';
+                }
+                return false;
+            }""",
+            subject,
+            timeout=timeout_ms,
+        )
+        return str(handle.json_value() or "")
+    except PlaywrightTimeoutError:
         return ""
 
-    body_l = body.lower()
-    valid_heading = (
-        "fall 2026" in body_l
-        and "kapiolani community college" in body_l
-        and subject.lower() in body_l
-    )
-    table_header = "crn" in body_l and "course" in body_l and "credits" in body_l
-    explicit_empty = bool(
-        re.search(
-            r"no (?:classes|sections|courses|results)|"
-            r"there are no (?:classes|sections|courses)|"
-            r"0 (?:classes|sections|courses)",
-            body_l,
-        )
-    )
-
-    generic_selector = (
-        "select a term" in body_l
-        and "select a campus" in body_l
-        and "class availability portal" in body_l
-    )
-
-    if generic_selector:
-        return "not_available"
-    if explicit_empty or (valid_heading and table_header):
-        return "empty"
-    return ""
 
 
 def subjects_for_refresh(old_records: list[dict[str, Any]]) -> list[str]:
-    """Return a stable refresh list without depending on the landing-page UI.
+    """Refresh the alphas represented in the published Fall 2026 snapshot.
 
-    The UH portal redirects an unavailable subject alpha to its generic
-    term/campus selector. We can safely probe a broad known list because
-    fetch_subject() recognizes that redirect as zero sections. Alphas already
-    present in the published snapshot are always included as well.
+    Mid-semester, probing every historical Kapiʻolani alpha wastes time and
+    increases the chance of a transient UH timeout.  Existing snapshot alphas
+    are enough to keep current Fall 2026 sections fresh; ESOL and IS are always
+    included because they are required validation anchors.
     """
     from_snapshot = {
         str(record.get("courseAlpha") or "").upper()
         for record in old_records
         if str(record.get("courseAlpha") or "").strip()
     }
-    subjects = sorted(set(SUBJECTS) | from_snapshot)
+    subjects = sorted(from_snapshot | {"ESOL", "IS"})
+    # Put ESOL first so a broad UH outage is detected near the start.
+    subjects.sort(key=lambda code: (code != "ESOL", code))
     print(
-        f"Refreshing {len(subjects)} known/current subject alphas.",
+        f"Refreshing {len(subjects)} Fall 2026 subject alphas from the published snapshot.",
         flush=True,
     )
     return subjects
@@ -491,43 +499,51 @@ def fetch_subject(
     page: Page,
     subject: str,
     *,
-    goto_timeout_ms: int = 15000,
-    ready_timeout_s: float = 5.0,
+    goto_timeout_ms: int = 12000,
+    ready_timeout_ms: int = 12000,
 ) -> list[dict[str, Any]]:
     url = f"{SOURCE_ROOT}/{TERM}/{CAMPUS}/{subject}"
 
     try:
+        # "commit" returns as soon as the server has committed the response.
+        # Waiting for DOMContentLoaded was occasionally hanging on slow UH
+        # JavaScript/assets even though the subject data later loaded normally.
         response = page.goto(
             url,
-            wait_until="domcontentloaded",
+            wait_until="commit",
             timeout=goto_timeout_ms,
         )
-    except Exception:
-        save_diagnostic(page, subject, "navigation_failure")
-        raise
+    except Exception as exc:
+        DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+        (DIAGNOSTIC_DIR / f"navigation_failure_{subject.lower()}.txt").write_text(
+            f"URL: {url}\n\n{type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+        raise RuntimeError(f"{subject}: navigation failed: {exc}") from exc
 
     status = response.status if response else None
     if status is not None and status >= 400:
-        save_diagnostic(page, subject, f"http_{status}")
         raise RuntimeError(f"HTTP {status} for {url}")
 
-    deadline = time.monotonic() + ready_timeout_s
-    state = ""
-    while time.monotonic() < deadline:
-        state = subject_page_state(page, subject)
-        if state:
-            break
-        time.sleep(0.25)
+    state = wait_for_subject_state(
+        page,
+        subject,
+        timeout_ms=ready_timeout_ms,
+    )
 
     if not state:
-        save_diagnostic(page, subject, "unexpected_page")
+        # At this point navigation succeeded, so the page is normally responsive
+        # enough for a diagnostic snapshot. Keep diagnostics best-effort.
+        try:
+            save_diagnostic(page, subject, "unexpected_page")
+        except Exception as exc:
+            print(f"[diagnostic] Snapshot failed: {exc}", flush=True)
         raise RuntimeError(
-            f"{subject}: page never looked like a Fall 2026 Kapiʻolani subject page "
-            f"within {ready_timeout_s:.1f} seconds. Final URL: {page.url}"
+            f"{subject}: no usable subject-page state within "
+            f"{ready_timeout_ms / 1000:.0f} seconds. Final URL: {page.url}"
         )
 
     if state == "not_available":
-        print("not currently listed", flush=True)
         return []
 
     html = page.content()
@@ -542,6 +558,7 @@ def fetch_subject(
     return records
 
 
+
 def smoke_test(
     page: Page,
     old_records: list[dict[str, Any]] | None = None,
@@ -551,7 +568,7 @@ def smoke_test(
         page,
         "ESOL",
         goto_timeout_ms=12000,
-        ready_timeout_s=4.0,
+        ready_timeout_ms=12000,
     )
     if not records:
         save_diagnostic(page, "ESOL", "preflight_no_rows")
@@ -601,7 +618,7 @@ def smoke_test(
 
 
 def collect(
-    page: Page,
+    context,
     subjects: list[str],
     delay: float = 0.15,
 ) -> list[dict[str, Any]]:
@@ -614,16 +631,39 @@ def collect(
             end="",
             flush=True,
         )
-        try:
-            records = fetch_subject(page, subject)
-            all_records.extend(records)
-            print(f"{len(records)} section(s)", flush=True)
-        except Exception as exc:
-            errors.append(f"{subject}: {exc}")
-            print(f"ERROR: {exc}", flush=True)
-            # One bad subject means the snapshot would be incomplete. Fail fast
-            # rather than waiting through the rest of the alphabet.
+
+        records: list[dict[str, Any]] | None = None
+        last_exc: Exception | None = None
+
+        for attempt in (1, 2):
+            page = context.new_page()
+            page.set_default_timeout(5000)
+            page.set_default_navigation_timeout(12000)
+            try:
+                records = fetch_subject(page, subject)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 1:
+                    print(
+                        f"attempt 1 failed ({exc}); retrying once ... ",
+                        end="",
+                        flush=True,
+                    )
+                    time.sleep(1.5)
+            finally:
+                try:
+                    page.close(run_before_unload=False)
+                except Exception:
+                    pass
+
+        if records is None:
+            errors.append(f"{subject}: {last_exc}")
+            print(f"ERROR: {last_exc}", flush=True)
             break
+
+        all_records.extend(records)
+        print(f"{len(records)} section(s)", flush=True)
 
         if delay:
             time.sleep(delay)
@@ -655,6 +695,8 @@ def collect(
                 by_key[key] = record
 
     return list(by_key.values())
+
+
 
 def extract_data(html: str) -> tuple[list[dict[str, Any]], int, int]:
     start_marker = "const DATA="
@@ -798,19 +840,22 @@ def main() -> None:
                 "Chrome/126.0 Safari/537.36"
             ),
         )
-        page = context.new_page()
-        page.set_default_timeout(5000)
-        page.set_default_navigation_timeout(15000)
-
-        smoke_test(page, old_records)
         subjects = subjects_for_refresh(old_records)
 
         if args.smoke_test:
+            page = context.new_page()
+            page.set_default_timeout(5000)
+            page.set_default_navigation_timeout(12000)
+            smoke_test(page, old_records)
+            try:
+                page.close(run_before_unload=False)
+            except Exception:
+                pass
             browser.close()
             return
 
         records = collect(
-            page,
+            context,
             subjects,
             delay=max(0.0, args.delay),
         )
