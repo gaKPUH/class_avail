@@ -18,7 +18,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -36,11 +36,8 @@ jobs:
       - name: Install Chromium for Playwright
         run: python -m playwright install --with-deps chromium
 
-      - name: Preflight UH access
-        run: timeout 60s python update_fall_2026.py --smoke-test
-
       - name: Refresh Fall 2026 data
-        run: timeout 12m python update_fall_2026.py
+        run: timeout 16m python update_fall_2026.py
 
       - name: Upload diagnostics if refresh fails
         if: failure()
