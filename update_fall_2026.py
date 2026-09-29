@@ -48,8 +48,8 @@ SUBJECT_TO_DEPARTMENT = {
     "ACC": "BUS", "AMST": "HUM", "ANTH": "SSCI", "ART": "HUM", "ASAN": "HUM", "ASL": "LLL", "ASTR": "MS",
     "BIOC": "MS", "BIOL": "MS", "BLAW": "BUS", "BOT": "MS", "BUS": "BUS",
     "CE": "MS", "CHEM": "MS", "CHN": "LLL", "CHW": "HS", "COM": "LLL", "CULN": "CULN",
-    "DENT": "HS", "DNCE": "HUM", "EALL": "LLL", "ECON": "SSCI", "ED": "SSCI", "EE": "MS",
-    "EMT": "EMS", "ENG": "LLL", "ENT": "BUS", "ERTH": "MS", "ES": "HUM", "ESL": "LLL", "ESOL": "LLL", "ESS": "MS",
+    "DENT": "HS", "DMS": "HS", "DNCE": "HUM", "EALL": "LLL", "ECE": "MS", "ECON": "SSCI", "ED": "SSCI", "EE": "MS",
+    "EMSP": "EMS", "EMT": "EMS", "ENG": "LLL", "ENT": "BUS", "ERTH": "MS", "ES": "HUM", "ESL": "LLL", "ESOL": "LLL", "ESS": "MS",
     "FIL": "LLL", "FR": "LLL", "FSHE": "FSER", "GEO": "SSCI", "HAW": "LLL", "HDFS": "SSCI",
     "HIST": "HUM", "HLTH": "HS", "HOST": "HOSP", "HUM": "HUM", "HWST": "HUM",
     "ICS": "MS", "IS": "LLL", "ITS": "BUS", "JPN": "LLL", "JOUR": "LLL", "KOR": "LLL",
@@ -58,7 +58,7 @@ SUBJECT_TO_DEPARTMENT = {
     "NREM": "MS", "NURS": "NURS", "OCN": "MS", "OEST": "MS", "OTA": "HS",
     "PACS": "HUM", "PHIL": "HUM", "PHRM": "HS", "PHYL": "MS", "PHYS": "MS", "POLS": "SSCI", "PSY": "SSCI", "PTA": "HS",
     "RAD": "HS", "REL": "HUM", "RESP": "HS", "SCI": "MS", "SLT": "LLL", "SOC": "SSCI",
-    "SP": "HUM", "SPAN": "LLL", "SSCI": "SSCI", "SW": "SSCI", "THEA": "HUM", "WS": "HUM", "ZOO": "MS",
+    "SP": "HUM", "SPAN": "LLL", "SSCI": "SSCI", "SUST": "SSCI", "SW": "SSCI", "THEA": "HUM", "WS": "HUM", "ZOO": "MS",
 }
 
 DAY_LABELS = {"M": "Mon", "T": "Tue", "W": "Wed", "R": "Thu", "F": "Fri", "S": "Sat", "U": "Sun"}
@@ -421,6 +421,67 @@ def subject_page_state(page: Page, subject: str) -> str:
     return ""
 
 
+def discover_subjects(page: Page) -> list[str]:
+    """Read the current Kapiʻolani subject list from the UH portal.
+
+    This avoids keeping a stale hard-coded alpha list. Subjects can be added or
+    removed during a term, and an unavailable alpha redirects to the generic
+    subject selector rather than returning a conventional 404.
+    """
+    url = f"{SOURCE_ROOT}/{TERM}/{CAMPUS}"
+    print("Discovering current Kapiʻolani subject list ...", flush=True)
+
+    try:
+        response = page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+    except Exception:
+        save_diagnostic(page, "SUBJECTS", "subject_list_navigation_failure")
+        raise
+
+    status = response.status if response else None
+    if status is not None and status >= 400:
+        save_diagnostic(page, "SUBJECTS", f"subject_list_http_{status}")
+        raise RuntimeError(f"HTTP {status} while loading {url}")
+
+    deadline = time.monotonic() + 8.0
+    subjects: list[str] = []
+
+    while time.monotonic() < deadline:
+        try:
+            texts = page.locator("button").all_inner_texts()
+        except Exception:
+            texts = []
+
+        found: list[str] = []
+        for raw in texts:
+            code = clean(raw).upper()
+            if re.fullmatch(r"[A-Z][A-Z0-9]{1,5}", code):
+                if code not in found:
+                    found.append(code)
+
+        if len(found) >= 40 and "ESOL" in found and "IS" in found:
+            subjects = found
+            break
+
+        time.sleep(0.25)
+
+    if not subjects:
+        save_diagnostic(page, "SUBJECTS", "subject_list_unexpected")
+        raise RuntimeError(
+            "Could not discover a plausible Kapiʻolani subject list from the UH portal."
+        )
+
+    print(
+        f"Discovered {len(subjects)} current subjects: "
+        + ", ".join(subjects),
+        flush=True,
+    )
+    return subjects
+
+
 def fetch_subject(
     page: Page,
     subject: str,
@@ -500,13 +561,17 @@ def smoke_test(page: Page) -> None:
     print(f"Preflight passed: ESOL returned {len(records)} section(s).", flush=True)
 
 
-def collect(page: Page, delay: float = 0.15) -> list[dict[str, Any]]:
+def collect(
+    page: Page,
+    subjects: list[str],
+    delay: float = 0.15,
+) -> list[dict[str, Any]]:
     all_records: list[dict[str, Any]] = []
     errors: list[str] = []
 
-    for index, subject in enumerate(SUBJECTS, 1):
+    for index, subject in enumerate(subjects, 1):
         print(
-            f"[{index:02d}/{len(SUBJECTS):02d}] {subject}: ",
+            f"[{index:02d}/{len(subjects):02d}] {subject}: ",
             end="",
             flush=True,
         )
@@ -699,11 +764,17 @@ def main() -> None:
         page.set_default_navigation_timeout(15000)
 
         smoke_test(page)
+        subjects = discover_subjects(page)
+
         if args.smoke_test:
             browser.close()
             return
 
-        records = collect(page, delay=max(0.0, args.delay))
+        records = collect(
+            page,
+            subjects,
+            delay=max(0.0, args.delay),
+        )
         browser.close()
 
     preserve_catalog(old_records, records)
