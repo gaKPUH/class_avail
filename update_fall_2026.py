@@ -20,10 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, Tag
-import requests
-from requests import Session
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 SOURCE_ROOT = "https://www.sis.hawaii.edu:9350/crseavail"
 TERM = "202710"
@@ -401,88 +398,87 @@ def parse_subject_html(page_html: str, expected_subject: str = "") -> list[dict[
     return records
 
 
-def save_http_diagnostic(subject: str, label: str, text: str) -> None:
+def save_diagnostic(page: Page, subject: str, label: str) -> None:
     DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
-    path = DIAGNOSTIC_DIR / f"{label}_{subject.lower()}.html"
-    path.write_text(text, encoding="utf-8")
-    print(f"[diagnostic] Saved {path}", flush=True)
+    stem = f"{label}_{subject.lower()}"
+    html_path = DIAGNOSTIC_DIR / f"{stem}.html"
+    png_path = DIAGNOSTIC_DIR / f"{stem}.png"
+    txt_path = DIAGNOSTIC_DIR / f"{stem}.txt"
+
+    try:
+        html_path.write_text(page.content(), encoding="utf-8")
+    except Exception as exc:
+        print(f"[diagnostic] Could not save HTML: {exc}")
+
+    try:
+        page.screenshot(path=str(png_path), full_page=True)
+    except Exception as exc:
+        print(f"[diagnostic] Could not save screenshot: {exc}")
+
+    try:
+        body = page.locator("body").inner_text(timeout=2000)
+    except Exception as exc:
+        body = f"Could not read body text: {exc}"
+
+    txt_path.write_text(
+        f"URL: {page.url}\n\n{body[:12000]}",
+        encoding="utf-8",
+    )
+    print(f"[diagnostic] Saved {html_path}, {png_path}, and {txt_path}")
 
 
-def html_page_state(page_html: str, subject: str) -> str:
-    soup = BeautifulSoup(page_html, "html.parser")
-    if soup.select("tr.dataRow"):
+def subject_page_state(page: Page, subject: str) -> str:
+    if page.locator("tr.dataRow").count() > 0:
         return "rows"
 
-    body = soup.get_text(" ", strip=True).lower()
-    generic = (
-        "select a term" in body
-        and "select a campus" in body
-        and "class availability portal" in body
-    )
-    if generic:
-        return "not_available"
+    try:
+        body = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return ""
 
+    body_l = body.lower()
     valid_heading = (
-        "fall 2026" in body
-        and "kapiolani community college" in body
-        and subject.lower() in body
+        "fall 2026" in body_l
+        and "kapiolani community college" in body_l
+        and subject.lower() in body_l
     )
-    table_header = "crn" in body and "course" in body and "credits" in body
+    table_header = "crn" in body_l and "course" in body_l and "credits" in body_l
     explicit_empty = bool(
         re.search(
             r"no (?:classes|sections|courses|results)|"
             r"there are no (?:classes|sections|courses)|"
             r"0 (?:classes|sections|courses)",
-            body,
+            body_l,
         )
     )
 
+    generic_selector = (
+        "select a term" in body_l
+        and "select a campus" in body_l
+        and "class availability portal" in body_l
+    )
+
+    if generic_selector:
+        return "not_available"
     if explicit_empty or (valid_heading and table_header):
         return "empty"
     return ""
 
 
-def build_http_session() -> Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
-        backoff_factor=1.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,*/*;q=0.8"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Connection": "close",
-        }
-    )
-    return session
-
-
 def subjects_for_refresh(old_records: list[dict[str, Any]]) -> list[str]:
-    """Refresh the alphas represented in the published Fall 2026 snapshot."""
-    from_snapshot = {
-        str(record.get("courseAlpha") or "").upper()
-        for record in old_records
-        if str(record.get("courseAlpha") or "").strip()
-    }
-    subjects = sorted(from_snapshot | {"ESOL", "IS"})
+    """Refresh the Fall 2026 alphas already represented in the published snapshot.
+
+    This keeps the daily Mac refresh focused on active Fall 2026 subjects and
+    avoids probing historical alphas that are not currently represented.
+    """
+    subjects = sorted(
+        {
+            str(record.get("courseAlpha") or "").upper()
+            for record in old_records
+            if str(record.get("courseAlpha") or "").strip()
+        }
+        | {"ESOL", "IS"}
+    )
     subjects.sort(key=lambda code: (code != "ESOL", code))
     print(
         f"Refreshing {len(subjects)} Fall 2026 subject alphas from the published snapshot.",
@@ -491,73 +487,78 @@ def subjects_for_refresh(old_records: list[dict[str, Any]]) -> list[str]:
     return subjects
 
 
-def fetch_subject_http(
-    session: Session,
+
+def fetch_subject(
+    page: Page,
     subject: str,
     *,
-    timeout: tuple[float, float] = (10.0, 25.0),
+    goto_timeout_ms: int = 15000,
+    ready_timeout_s: float = 5.0,
 ) -> list[dict[str, Any]]:
     url = f"{SOURCE_ROOT}/{TERM}/{CAMPUS}/{subject}"
 
     try:
-        response = session.get(
+        response = page.goto(
             url,
-            timeout=timeout,
-            allow_redirects=True,
+            wait_until="domcontentloaded",
+            timeout=goto_timeout_ms,
         )
-    except requests.RequestException as exc:
-        DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
-        path = DIAGNOSTIC_DIR / f"request_failure_{subject.lower()}.txt"
-        path.write_text(
-            f"URL: {url}\n\n{type(exc).__name__}: {exc}\n",
-            encoding="utf-8",
-        )
-        raise RuntimeError(f"{subject}: HTTP request failed: {exc}") from exc
+    except Exception:
+        save_diagnostic(page, subject, "navigation_failure")
+        raise
 
-    if response.status_code >= 400:
-        save_http_diagnostic(
-            subject,
-            f"http_{response.status_code}",
-            response.text,
-        )
-        raise RuntimeError(
-            f"{subject}: HTTP {response.status_code} from {response.url}"
-        )
+    status = response.status if response else None
+    if status is not None and status >= 400:
+        save_diagnostic(page, subject, f"http_{status}")
+        raise RuntimeError(f"HTTP {status} for {url}")
 
-    page_html = response.text
-    state = html_page_state(page_html, subject)
-
-    if state == "not_available":
-        return []
+    deadline = time.monotonic() + ready_timeout_s
+    state = ""
+    while time.monotonic() < deadline:
+        state = subject_page_state(page, subject)
+        if state:
+            break
+        time.sleep(0.25)
 
     if not state:
-        save_http_diagnostic(subject, "unexpected_page", page_html)
+        save_diagnostic(page, subject, "unexpected_page")
         raise RuntimeError(
-            f"{subject}: HTTP response did not look like a usable Fall 2026 "
-            f"Kapiʻolani subject page. Final URL: {response.url}"
+            f"{subject}: page never looked like a Fall 2026 Kapiʻolani subject page "
+            f"within {ready_timeout_s:.1f} seconds. Final URL: {page.url}"
         )
 
-    records = parse_subject_html(page_html, subject)
+    if state == "not_available":
+        print("not currently listed", flush=True)
+        return []
+
+    html = page.content()
+    records = parse_subject_html(html, subject)
 
     if state == "rows" and not records:
-        save_http_diagnostic(subject, "parser_failure", page_html)
+        save_diagnostic(page, subject, "parser_failure")
         raise RuntimeError(
-            f"{subject}: the HTTP page had course rows, but the parser extracted none."
+            f"{subject}: the page had course rows, but the parser extracted none."
         )
 
     return records
 
 
 def smoke_test(
-    session: Session,
+    page: Page,
     old_records: list[dict[str, Any]] | None = None,
 ) -> None:
-    print("Preflight: testing UH access with ESOL over direct HTTP ...", flush=True)
-    records = fetch_subject_http(session, "ESOL")
-
+    print("Preflight: testing UH access with ESOL ...", flush=True)
+    records = fetch_subject(
+        page,
+        "ESOL",
+        goto_timeout_ms=12000,
+        ready_timeout_s=4.0,
+    )
     if not records:
+        save_diagnostic(page, "ESOL", "preflight_no_rows")
         raise RuntimeError(
-            "Preflight failed: ESOL returned no course rows."
+            "Preflight failed: ESOL returned no course rows. "
+            "The GitHub runner may not be seeing the same UH page as a normal browser."
         )
 
     wrong = sorted(
@@ -565,6 +566,7 @@ def smoke_test(
         - {"ESOL"}
     )
     if wrong:
+        save_diagnostic(page, "ESOL", "preflight_wrong_alpha")
         raise RuntimeError(
             f"Preflight failed: unexpected course alphas on ESOL page: {wrong}"
         )
@@ -590,10 +592,17 @@ def smoke_test(
             print("ESOL CRNs newly seen live: " + ", ".join(added), flush=True)
         if removed:
             print("ESOL CRNs no longer seen live: " + ", ".join(removed), flush=True)
+        if len(old_esol) != len(records) and not added and not removed:
+            print(
+                "ESOL row count changed but the CRN set did not; "
+                "this suggests a duplicate/grouped presentation difference rather than a new CRN.",
+                flush=True,
+            )
+
 
 
 def collect(
-    session: Session,
+    page: Page,
     subjects: list[str],
     delay: float = 0.15,
 ) -> list[dict[str, Any]]:
@@ -606,16 +615,16 @@ def collect(
             end="",
             flush=True,
         )
-
         try:
-            records = fetch_subject_http(session, subject)
+            records = fetch_subject(page, subject)
+            all_records.extend(records)
+            print(f"{len(records)} section(s)", flush=True)
         except Exception as exc:
             errors.append(f"{subject}: {exc}")
             print(f"ERROR: {exc}", flush=True)
+            # One bad subject means the snapshot would be incomplete. Fail fast
+            # rather than waiting through the rest of the alphabet.
             break
-
-        all_records.extend(records)
-        print(f"{len(records)} section(s)", flush=True)
 
         if delay:
             time.sleep(delay)
@@ -647,8 +656,6 @@ def collect(
                 by_key[key] = record
 
     return list(by_key.values())
-
-
 
 def extract_data(html: str) -> tuple[list[dict[str, Any]], int, int]:
     start_marker = "const DATA="
@@ -780,18 +787,35 @@ def main() -> None:
     old_records, data_start, data_end = extract_data(template)
     print(f"Existing browser contains {len(old_records)} sections.")
 
-    session = build_http_session()
-    subjects = subjects_for_refresh(old_records)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            ignore_https_errors=True,
+            viewport={"width": 1500, "height": 1000},
+            locale="en-US",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+        page.set_default_timeout(5000)
+        page.set_default_navigation_timeout(15000)
 
-    if args.smoke_test:
-        smoke_test(session, old_records)
-        return
+        smoke_test(page, old_records)
+        subjects = subjects_for_refresh(old_records)
 
-    records = collect(
-        session,
-        subjects,
-        delay=max(0.0, args.delay),
-    )
+        if args.smoke_test:
+            browser.close()
+            return
+
+        records = collect(
+            page,
+            subjects,
+            delay=max(0.0, args.delay),
+        )
+        browser.close()
 
     preserve_catalog(old_records, records)
     records.sort(
