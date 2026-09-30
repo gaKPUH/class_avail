@@ -8,6 +8,17 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
 
+STATE_FILE="$REPO_DIR/.last-successful-refresh"
+TODAY="$(TZ=Pacific/Honolulu date '+%Y-%m-%d')"
+FORCE=0
+
+if [[ "${1:-}" == "--force" ]]; then
+  FORCE=1
+elif [[ -n "${1:-}" ]]; then
+  echo "Usage: $0 [--force]"
+  exit 2
+fi
+
 LOCK_DIR="$REPO_DIR/.refresh-lock"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "[$(date)] Another class-availability refresh is already running; exiting."
@@ -17,8 +28,21 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 echo
 echo "============================================================"
-echo "[$(date)] Starting Fall 2026 class-availability refresh"
+echo "[$(date)] Checking Fall 2026 class availability"
 echo "Repository: $REPO_DIR"
+echo "Hawaiʻi date: $TODAY"
+
+if [[ "$FORCE" -eq 0 && -f "$STATE_FILE" ]]; then
+  LAST_SUCCESS="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  if [[ "$LAST_SUCCESS" == "$TODAY" ]]; then
+    echo "Today's refresh already completed successfully; nothing to do."
+    exit 0
+  fi
+fi
+
+if [[ "$FORCE" -eq 1 ]]; then
+  echo "Forced refresh requested; ignoring today's success marker."
+fi
 
 # Never overwrite uncommitted local work.
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -27,6 +51,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
+echo "Today's refresh has not succeeded yet. Starting catch-up update..."
 echo "Updating local repository from GitHub..."
 git pull --ff-only origin main
 
@@ -57,7 +82,9 @@ fi
 git add index.html course_browser_fall_2026_current.json
 
 if git diff --cached --quiet; then
-  echo "No publishable changes were produced."
+  echo "Refresh completed successfully; no publishable changes were produced."
+  printf '%s\n' "$TODAY" > "$STATE_FILE"
+  echo "Recorded successful daily refresh for $TODAY."
   exit 0
 fi
 
@@ -65,4 +92,9 @@ STAMP="$(TZ=Pacific/Honolulu date '+%Y-%m-%d %H:%M HST')"
 git commit -m "Refresh Fall 2026 course availability — $STAMP"
 git push origin main
 
+# Mark the day successful only after the validated refresh and any needed push
+# have both completed successfully. Failed attempts remain eligible for retry.
+printf '%s\n' "$TODAY" > "$STATE_FILE"
+
 echo "[$(date)] Refresh complete. GitHub Pages deployment will start automatically."
+echo "Recorded successful daily refresh for $TODAY."
