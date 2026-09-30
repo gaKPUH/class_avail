@@ -2,3 +2,4 @@
 diagnostics/
 .refresh-lock/
 .DS_Store
+.last-successful-refresh
