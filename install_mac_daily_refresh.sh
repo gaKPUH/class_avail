@@ -30,13 +30,15 @@ cat > "$PLIST" <<EOF
     <key>WorkingDirectory</key>
     <string>$REPO_DIR</string>
 
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>7</integer>
-        <key>Minute</key>
-        <integer>15</integer>
-    </dict>
+    <!-- Run once when this LaunchAgent is loaded at login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Check every 30 minutes while the user session is running.
+         The refresh script exits immediately after one successful update
+         has already been recorded for the current Hawaiʻi calendar day. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
 
     <key>StandardOutPath</key>
     <string>$LOG_FILE</string>
@@ -47,14 +49,23 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
+# Replace any previously installed fixed-time version with the catch-up version.
 launchctl bootout "gui/$UID_NUM" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
 launchctl enable "gui/$UID_NUM/$LABEL"
 
-echo "Installed daily class-availability refresh."
-echo "Schedule: 7:15 AM local Mac time"
+echo "Installed catch-up class-availability refresh."
+echo "Behavior:"
+echo "  • checks immediately when the LaunchAgent loads at login"
+echo "  • checks every 30 minutes while your Mac user session is running"
+echo "  • performs at most one successful refresh per Hawaiʻi calendar day"
+echo "  • retries later if an earlier attempt fails"
+echo
 echo "LaunchAgent: $PLIST"
 echo "Log: $LOG_FILE"
 echo
 echo "To test the LaunchAgent manually:"
 echo "  launchctl kickstart -k gui/$UID_NUM/$LABEL"
+echo
+echo "To force a refresh even if today already succeeded:"
+echo "  zsh \"$REPO_DIR/refresh_and_publish_mac.sh\" --force"
